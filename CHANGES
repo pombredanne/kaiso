@@ -1,3 +1,43 @@
+Version 0.14.3
+--------------
+
+New module `migration_helpers` with tools to aid in making "schema" changes,
+e.g. altering the type hierarchy. Initially adds `validate_base_change` to
+check consistency is retained when changing the bases of a type.
+
+
+Version 0.14.2
+--------------
+
+Cache descriptors for static types.
+Cache all descriptor properties.
+
+
+Version 0.14.1
+--------------
+
+Fix indexes when type of instance is changed.
+
+Don't pin version of iso8601 library, allow future versions as well.
+
+Applied attempted workaround for intermittent " UNNAMEDx" issue seen in earlier
+releases of Neo4j 1.9 server.
+
+
+Version 0.14.0
+--------------
+
+Add `Manager.get_by_unique_attr` to bulk load objects given a list of values
+for a unique attribute.
+
+
+Version 0.13.4
+--------------
+
+Bugfix: `change_instance_type` now creates the correct properties with the
+new InstanceOf relationship.
+
+
 Version 0.13.3
 --------------
 

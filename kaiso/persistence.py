@@ -13,12 +13,19 @@ from kaiso.queries import (
     join_lines)
 from kaiso.references import set_store_for_object
 from kaiso.relationships import InstanceOf, IsA, DeclaredOn
-from kaiso.serialize import dict_to_db_values_dict, get_changes
+from kaiso.serialize import (
+    dict_to_db_values_dict, get_changes, object_to_db_value)
 from kaiso.types import (
     INTERNAL_CLASS_ATTRS, Descriptor, Persistable, PersistableType,
-    Relationship, TypeRegistry, AttributedBase, get_index_name, get_type_id,
-    is_indexable)
+    Relationship, TypeRegistry, AttributedBase, get_declaring_class,
+    get_index_name, get_type_id, is_indexable)
 from kaiso.utils import dict_difference
+
+
+# Note: some Cypher queries contain dummy names for unused nodes, e.g. (dummy1)
+# instead of (). This is an attempted workaround for an intermittent Cypher
+# bug (https://github.com/neo4j/neo4j/issues/1040) and may be removed when
+# used against later versions of Neo4j.
 
 
 log = getLogger(__name__)
@@ -189,6 +196,8 @@ class Manager(object):
             try:
                 cls = registry.get_class_by_id(type_id)
 
+                # static types also get loaded into dynamic registry
+                # to allow them to be augmented
                 if registry.is_static_type(cls):
                     cls = None
             except UnknownType:
@@ -238,6 +247,10 @@ class Manager(object):
                 return None, {}
 
             existing_cls_attrs = cls_node._properties
+
+            # Make sure we get a clean view of current data.
+            registry.refresh_type(persistable)
+
             new_cls_attrs = registry.object_to_dict(persistable)
 
             # If any existing keys in "new" are missing in "old", add `None`s.
@@ -372,7 +385,7 @@ class Manager(object):
                     start_clauses.append(
                         get_start_clause(new_start, 'start_node', registry)
                     )
-                    match_start_node = '()'
+                    match_start_node = '(dummy1)'  # See note at top of page
                 else:
                     match_start_node = 'start_node'
 
@@ -380,7 +393,7 @@ class Manager(object):
                     start_clauses.append(
                         get_start_clause(new_end, 'end_node', registry)
                     )
-                    match_end_node = '()'
+                    match_end_node = '(dummy2)'  # See note at top of page
                 else:
                     match_end_node = 'end_node'
 
@@ -483,11 +496,14 @@ class Manager(object):
         """
 
         if start_type_id:
-            match = 'p=(ts -[:DEFINES]-> () <-[:ISA*]- opt <-[:ISA*0..]- tpe)'
+            # See note at top of page
+            match = ('p=(ts -[:DEFINES]-> (dummy1) <-[:ISA*]- opt '
+                     '<-[:ISA*0..]- tpe)')
             where = 'WHERE opt.id = {start_id}'
             query_args = {'start_id': start_type_id}
         else:
-            match = 'p=(ts -[:DEFINES]-> () <-[:ISA*0..]- tpe)'
+            # See note at top of page
+            match = 'p=(ts -[:DEFINES]-> (dummy1) <-[:ISA*0..]- tpe)'
             where = ''
             query_args = {}
 
@@ -608,7 +624,7 @@ class Manager(object):
         query = join_lines(
             "START",
             (start_clauses, ','),
-            "MATCH type -[r:ISA]-> ()",
+            "MATCH type -[r:ISA]-> (dummy1)",  # See note at top of page
             "DELETE r",
             "CREATE",
             (create_clauses, ','),
@@ -695,8 +711,9 @@ class Manager(object):
             query = join_lines(
                 'START root=node:%s(id={idx_value})' % idx_name,
                 'MATCH ',
-                '    n -[:INSTANCEOF]-> ()',
-                '    -[:ISA*0..]-> tpe -[:ISA*0..]-> () <-[:DEFINES]- root',
+                '    n -[:INSTANCEOF]-> (dummy1)',   # See note at top of page
+                '    -[:ISA*0..]-> tpe -[:ISA*0..]-> (dummy2) '
+                '    <-[:DEFINES]- root',
                 'WHERE %s' % idx_where,
                 '   AND tpe.id = {tpe_id}',
                 'RETURN n',
@@ -723,6 +740,44 @@ class Manager(object):
         obj = self._convert_value(first)
         return obj
 
+    def get_by_unique_attr(self, cls, attr_name, values):
+        """Bulk load entities from a list of values for a unique attribute
+
+        Returns:
+            A generator (obj1, obj2, ...) corresponding to the `values` list
+
+        If any values are missing in the index, the corresponding obj is None
+        """
+
+        if not hasattr(cls, attr_name):
+            raise ValueError("{} has no attribute {}".format(cls, attr_name))
+
+        attr = getattr(cls, attr_name)
+        if not attr.unique:
+            raise ValueError("{}.{} is not unique".format(cls, attr_name))
+
+        batch = neo4j.ReadBatch(self._conn)
+
+        declaring_class = get_declaring_class(cls, attr_name)
+        index_name = get_index_name(declaring_class)
+
+        for value in values:
+            db_value = object_to_db_value(value)
+            batch.get_indexed_nodes(index_name, attr_name, db_value)
+
+        # When upgrading to py2neo 1.6, consider changing this to batch.stream
+        batch_result = batch.submit()
+
+        def first_or_none(list_):
+            return next(iter(list_), None)
+
+        # `batch_result` is a list of either one element lists (for matches)
+        # or empty lists. Unpack to flatten (and hydrate to Kaiso objects)
+        result = (self._convert_value(
+            first_or_none(row)) for row in batch_result)
+
+        return result
+
     def change_instance_type(self, obj, type_id, updated_values=None):
         if updated_values is None:
             updated_values = {}
@@ -741,24 +796,27 @@ class Manager(object):
 
         tpe = type_registry.get_class_by_id(type_id)
 
-        rel_props = type_registry.object_to_dict(InstanceOf, for_db=True)
+        rel_props = type_registry.object_to_dict(InstanceOf(), for_db=True)
 
         start_clauses = (
             get_start_clause(obj, 'obj', type_registry),
             get_start_clause(tpe, 'tpe', type_registry)
         )
 
+        # See note at top of page
         query = join_lines(
             'START',
             (start_clauses, ','),
-            'MATCH (obj)-[old_rel:INSTANCEOF]->()',
+            'MATCH (obj)-[old_rel:INSTANCEOF]->(dummy1)',
             'DELETE old_rel',
             'CREATE (obj)-[new_rel:INSTANCEOF {rel_props}]->(tpe)',
             'SET obj={properties}',
             'RETURN obj',
         )
 
-        results = self.query(query, properties=properties, rel_props=rel_props)
+        # use _execute; we need the raw object to add to the index
+        results = self._execute(
+            query, properties=properties, rel_props=rel_props)
         row = next(results, None)
 
         if row is None:
@@ -766,7 +824,24 @@ class Manager(object):
                 "{} not found in db".format(repr(obj))
             )
 
-        (new_obj,) = row
+        (node,) = row
+        new_obj = self._convert_value(node)
+
+        # update any indexes
+        old_indexes = set(type_registry.get_index_entries(obj))
+        new_indexes = set(type_registry.get_index_entries(new_obj))
+        indexes_to_remove = old_indexes - new_indexes
+        indexes_to_add = new_indexes - old_indexes
+
+        for index_name, key, value in indexes_to_remove:
+            index = self._conn.get_index(neo4j.Node, index_name)
+            index.remove(key, value)
+
+        for index_name, key, value in indexes_to_add:
+            index = self._conn.get_or_create_index(neo4j.Node, index_name)
+            index.add(key, value, node)
+
+        set_store_for_object(new_obj, self)
 
         return new_obj
 
@@ -830,7 +905,7 @@ class Manager(object):
                 'START {}',
                 'MATCH attr -[?:DECLAREDON]-> obj',
                 'DELETE attr',
-                'MATCH obj -[rel]- ()',
+                'MATCH obj -[rel]- (dummy1)',  # See note at top of page
                 'DELETE obj, rel',
                 'RETURN count(obj), count(rel)'
             ).format(
@@ -840,7 +915,7 @@ class Manager(object):
         else:
             query = join_lines(
                 'START {}',
-                'MATCH obj -[rel]- ()',
+                'MATCH obj -[rel]- (dummy1)',  # See note at top of page
                 'DELETE obj, rel',
                 'RETURN count(obj), count(rel)'
             ).format(
