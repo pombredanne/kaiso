@@ -93,6 +93,9 @@ class Manager(object):
         Returns:
             A generator with the raw rows returned by the connection.
         """
+        # 2.0 compatibility as we transition
+        query = "CYPHER 1.9 {}".format(query)
+
         log.debug('running query:\n%s', query.format(**params))
 
         rows, _ = cypher.execute(self._conn, query, params)
@@ -714,7 +717,7 @@ class Manager(object):
                 '    n -[:INSTANCEOF]-> (dummy1)',   # See note at top of page
                 '    -[:ISA*0..]-> tpe -[:ISA*0..]-> (dummy2) '
                 '    <-[:DEFINES]- root',
-                'WHERE %s' % idx_where,
+                'WHERE (%s)' % idx_where,
                 '   AND tpe.id = {tpe_id}',
                 'RETURN n',
             )
@@ -732,7 +735,7 @@ class Manager(object):
         # all the nodes returned should be the same
         first = found[0]
         for node in found:
-            if node.id != first.id:
+            if node._id != first._id:
                 raise UniqueConstraintError((
                     "Multiple nodes ({}) found for unique lookup for "
                     "{}").format(found, cls))
