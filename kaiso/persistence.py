@@ -1,34 +1,34 @@
+from __future__ import unicode_literals
+
 from logging import getLogger
 import uuid
 
 from py2neo import cypher, neo4j
 
 from kaiso.attributes import Outgoing, Incoming, String
-from kaiso.connection import get_connection
 from kaiso.exceptions import (
-    UniqueConstraintError, UnknownType, CannotUpdateType, UnsupportedTypeError,
-    TypeNotPersistedError, NoResultFound)
+    UnknownType, CannotUpdateType, UnsupportedTypeError,
+    TypeNotPersistedError, NoResultFound, NoUniqueAttributeError)
 from kaiso.queries import (
-    get_create_types_query, get_create_relationship_query, get_start_clause,
-    join_lines)
+    get_create_types_query, get_create_relationship_query, get_match_clause,
+    join_lines, parameter_map)
 from kaiso.references import set_store_for_object
 from kaiso.relationships import InstanceOf, IsA, DeclaredOn
 from kaiso.serialize import (
     dict_to_db_values_dict, get_changes, object_to_db_value)
 from kaiso.types import (
     INTERNAL_CLASS_ATTRS, Descriptor, Persistable, PersistableType,
-    Relationship, TypeRegistry, AttributedBase, get_declaring_class,
-    get_index_name, get_type_id, is_indexable)
+    Relationship, TypeRegistry, AttributedBase, get_type_id,
+    get_neo4j_relationship_name,
+)
 from kaiso.utils import dict_difference
 
 
-# Note: some Cypher queries contain dummy names for unused nodes, e.g. (dummy1)
-# instead of (). This is an attempted workaround for an intermittent Cypher
-# bug (https://github.com/neo4j/neo4j/issues/1040) and may be removed when
-# used against later versions of Neo4j.
-
-
 log = getLogger(__name__)
+
+
+def get_connection(uri):
+    return neo4j.GraphDatabaseService(uri)
 
 
 class TypeSystem(AttributedBase):
@@ -39,21 +39,6 @@ class TypeSystem(AttributedBase):
     tracked using a ``version`` attribute on the TypeSystem node.
     """
     id = String(unique=True)
-
-
-def get_attr_filter(obj, type_registry):
-    """ Generates a dictionary, that will identify the given ``obj``
-    based on it's unique attributes.
-
-    Args:
-        obj: An object to look up by index
-
-    Returns:
-        A dictionary of key-value pairs to indentify an object by.
-    """
-    indexes = type_registry.get_index_entries(obj)
-    index_filter = dict((key, value) for _, key, value in indexes)
-    return index_filter
 
 
 class Manager(object):
@@ -68,20 +53,34 @@ class Manager(object):
     """
     _type_registry_cache = None
 
-    def __init__(self, connection_uri, skip_type_loading=False):
+    def __init__(self, connection_uri, skip_setup=False):
         """ Initializes a Manager object.
 
         Args:
             connection_uri: A URI used to connect to the graph database.
         """
         self._conn = get_connection(connection_uri)
+
         self.type_system = TypeSystem(id='TypeSystem')
         self.type_registry = TypeRegistry()
-        idx_name = get_index_name(TypeSystem)
-        self._conn.get_or_create_index(neo4j.Node, idx_name)
-        self.save(self.type_system)
-        if not skip_type_loading:
-            self.reload_types()
+
+        if skip_setup:
+            return
+
+        batch = neo4j.WriteBatch(self._conn)
+        batch.append_cypher("""
+            CREATE CONSTRAINT ON (typesystem:TypeSystem)
+            ASSERT typesystem.id IS UNIQUE
+        """)
+        batch.append_cypher("""
+            CREATE CONSTRAINT ON (type:PersistableType)
+            ASSERT type.id IS UNIQUE
+        """)
+        batch.run()
+        # can't be in batch: "Cannot perform data updates in a transaction that
+        # has performed schema updates"
+        self.query('MERGE (ts:TypeSystem {id: "TypeSystem"})')
+        self.reload_types()
 
     def _execute(self, query, **params):
         """ Runs a cypher query returning only raw rows of data.
@@ -94,9 +93,9 @@ class Manager(object):
             A generator with the raw rows returned by the connection.
         """
         # 2.0 compatibility as we transition
-        query = "CYPHER 1.9 {}".format(query)
+        query = "CYPHER 2.0 {}".format(query)
 
-        log.debug('running query:\n%s', query.format(**params))
+        log.debug('running query:\n%s\n\nwith params %s', query, params)
 
         rows, _ = cypher.execute(self._conn, query, params)
 
@@ -115,7 +114,15 @@ class Manager(object):
         """
 
         if isinstance(value, (neo4j.Node, neo4j.Relationship)):
-            properties = value._properties
+            properties = value._properties.copy()
+
+            if isinstance(value, neo4j.Relationship):
+                # inject __type__ based on the relationship type in case it's
+                # missing. makes it easier to add relationship with cypher
+                neo4j_rel_name = value.type
+                type_id = self.type_registry.get_relationship_type_id(
+                    neo4j_rel_name)
+                properties['__type__'] = type_id
 
             obj = self.type_registry.dict_to_object(properties)
 
@@ -130,6 +137,10 @@ class Manager(object):
             else:
                 set_store_for_object(obj, self)
             return obj
+
+        elif isinstance(value, list):
+            return [self._convert_value(v) for v in value]
+
         return value
 
     def _convert_row(self, row):
@@ -139,45 +150,19 @@ class Manager(object):
             else:
                 yield self._convert_value(value)
 
-    def _index_object(self, obj, node_or_rel):
-
-        indexes = self.type_registry.get_index_entries(obj)
-        for index_name, key, value in indexes:
-            if isinstance(obj, Relationship):
-                index_type = neo4j.Relationship
-            else:
-                index_type = neo4j.Node
-
-            log.debug(
-                'indexing %s for %s using index %s',
-                obj, node_or_rel, index_name)
-
-            index = self._conn.get_or_create_index(index_type, index_name)
-            index.add(key, value, node_or_rel)
-
-        if not isinstance(obj, Relationship):
-            set_store_for_object(obj, self)
-
     def _type_system_version(self):
-        query = join_lines(
-            'START',
-            get_start_clause(self.type_system, 'ts', self.type_registry),
-            'RETURN ts.version?'
-        )
-
+        query = 'MATCH (ts:TypeSystem {id: "TypeSystem"}) RETURN ts.version'
         rows = self._execute(query)
         (version,) = next(rows)
         return version
 
     def invalidate_type_system(self):
-        query = join_lines(
-            'START',
-            get_start_clause(self.type_system, 'ts', self.type_registry),
-            'SET ts.version = {new_version}'
-        )
-
+        query = """
+            MATCH (ts:TypeSystem {id: "TypeSystem"})
+            SET ts.version = {new_version}
+        """
         new_version = uuid.uuid4().hex
-        next(self._execute(query, new_version=new_version), None)
+        self.query(query, new_version=new_version)
 
     def reload_types(self):
         """Reload the type registry for this instance from the graph
@@ -220,29 +205,27 @@ class Manager(object):
     def _get_changes(self, persistable):
         changes = {}
         existing = None
-        obj_type = type(persistable)
 
         registry = self.type_registry
 
         if isinstance(persistable, PersistableType):
-            # this is a class, we need to get it and it's attrs
-            idx_name = get_index_name(PersistableType)
-            self._conn.get_or_create_index(neo4j.Node, idx_name)
 
-            type_id = get_type_id(persistable)
-            query_args = {
-                'type_id': type_id
-            }
+            if issubclass(persistable, Relationship):
+                # not stored in the db; must be static
+                return None, {}
 
-            query = join_lines(
-                'START cls=node:%s(id={type_id})' % idx_name,
-                'MATCH attr -[:DECLAREDON*0..]-> cls',
-                'RETURN cls, collect(attr.name?)'
-            )
+            query = """
+                MATCH
+                    {}
+                OPTIONAL MATCH
+                    (attr)-[:DECLAREDON*0..]->(cls)
+                RETURN
+                    cls, collect(attr.name)
+            """.format(get_match_clause(persistable, 'cls', registry))
 
             # don't use self.query since we don't want to convert the py2neo
             # node into an object
-            rows = self._execute(query, **query_args)
+            rows = self._execute(query)
             cls_node, attrs = next(rows, (None, None))
 
             if cls_node is None:
@@ -284,10 +267,18 @@ class Manager(object):
                 changes['attributes'] = modified_attrs
 
             # we want to return the existing class
+            type_id = get_type_id(persistable)
             existing = registry.get_descriptor_by_id(type_id).cls
         else:
-            existing = self.get(obj_type, **get_attr_filter(persistable,
-                                                            registry))
+            try:
+                query = 'MATCH {} RETURN obj'.format(
+                    get_match_clause(persistable, 'obj', registry)
+                )
+            except NoUniqueAttributeError:
+                existing = None
+            else:
+                existing = self.query_single(query)
+
             if existing is not None:
                 existing_props = registry.object_to_dict(existing)
                 props = registry.object_to_dict(persistable)
@@ -301,19 +292,24 @@ class Manager(object):
 
     def _update_types(self, cls):
         query, objects, query_args = get_create_types_query(
-            cls, self.type_system, self.type_registry)
+            cls, self.type_system.id, self.type_registry)
 
-        nodes_or_rels = next(self._execute(query, **query_args))
+        self._execute(query, **query_args)
 
         for obj in objects:
             type_id = get_type_id(obj)
             self.type_registry._types_in_db.add(type_id)
-            if is_indexable(obj):
-                index_name = get_index_name(obj)
-                self._conn.get_or_create_index(neo4j.Node, index_name)
-
-        for obj, node_or_rel in zip(objects, nodes_or_rels):
-            self._index_object(obj, node_or_rel)
+            type_constraints = self.type_registry.get_constraints_for_type(obj)
+            for constraint_type_id, constraint_attr_name in type_constraints:
+                self.query(
+                    """
+                        CREATE CONSTRAINT ON (type:{type_id})
+                        ASSERT type.{attr_name} IS UNIQUE
+                    """.format(
+                        type_id=constraint_type_id,
+                        attr_name=constraint_attr_name,
+                    )
+                )
 
         # we can't tell whether the CREATE UNIQUE from get_create_types_query
         # will have any effect, so we must invalidate.
@@ -323,11 +319,6 @@ class Manager(object):
     def _update(self, persistable, existing, changes):
 
         registry = self.type_registry
-
-        for _, index_attr, _ in registry.get_index_entries(existing):
-            if index_attr in changes:
-                raise NotImplementedError(
-                    "We currently don't support changing unique attributes")
 
         set_clauses = ', '.join([
             'n.%s={%s}' % (key, key) for key, value in changes.items()
@@ -359,11 +350,11 @@ class Manager(object):
             else:
                 where = ''
 
-            index_name = get_index_name(PersistableType)
-
             query = join_lines(
-                'START n=node:%s(id={type_id})' % index_name,
+                'MATCH (n:PersistableType)',
+                'WHERE n.id = {type_id}',
                 set_clauses,
+                'WITH n',
                 'MATCH attr -[r:DECLAREDON]-> n',
                 where,
                 'DELETE attr, r',
@@ -371,56 +362,13 @@ class Manager(object):
             )
             self._update_types(persistable)
         else:
-            start_clause = get_start_clause(existing, 'n', registry)
-            query = None
-
-            if isinstance(persistable, Relationship):
-                start_clauses = [start_clause]
-
-                # if start or end have been set, we will do an index lookup
-                # to reference them when "updating" the relationship to
-                # point to them, if they are not set we look up the original
-                # ones using a MATCH clause and "update" the relationship.
-                new_start = getattr(persistable, 'start', None)
-                new_end = getattr(persistable, 'end', None)
-
-                if new_start is not None:
-                    start_clauses.append(
-                        get_start_clause(new_start, 'start_node', registry)
-                    )
-                    match_start_node = '(dummy1)'  # See note at top of page
-                else:
-                    match_start_node = 'start_node'
-
-                if new_end is not None:
-                    start_clauses.append(
-                        get_start_clause(new_end, 'end_node', registry)
-                    )
-                    match_end_node = '(dummy2)'  # See note at top of page
-                else:
-                    match_end_node = 'end_node'
-
-                start_clause = ', '.join(start_clauses)
-                rel_props = registry.object_to_dict(persistable, for_db=True)
-
-                query = join_lines(
-                    'START %s' % start_clause,
-                    'MATCH %s -[n]-> %s' % (match_start_node, match_end_node),
-                    'DELETE n',
-                    'CREATE start_node -[r:%s {rel_props}]-> end_node' % (
-                        rel_props['__type__'].upper()
-                    ),
-                    'RETURN r'
-                )
-                query_args = {'rel_props': rel_props}
-
-            if query is None:
-                query = join_lines(
-                    'START %s' % start_clause,
-                    set_clauses,
-                    'RETURN n'
-                )
-                query_args = changes
+            match_clause = get_match_clause(existing, 'n', registry)
+            query = join_lines(
+                'MATCH %s' % match_clause,
+                set_clauses,
+                'RETURN n'
+            )
+            query_args = changes
 
         try:
             (result,) = next(self._execute(query, **query_args))
@@ -428,8 +376,6 @@ class Manager(object):
             # this can happen, if no attributes where changed on a type
             result = persistable
 
-        if isinstance(persistable, Relationship):
-            self._index_object(persistable, result)
         return result
 
     def _add(self, obj):
@@ -439,6 +385,7 @@ class Manager(object):
         for the the object as required and store the object itself.
         """
 
+        type_registry = self.type_registry
         query_args = {}
         invalidates_types = False
 
@@ -446,45 +393,48 @@ class Manager(object):
             # object is a type; create the type and its hierarchy
             return self._update_types(obj)
 
-        elif obj is self.type_system:
-            query = 'CREATE (n {props}) RETURN n'
-
         elif isinstance(obj, Relationship):
             # object is a relationship
             obj_type = type(obj)
 
             if obj_type in (IsA, DeclaredOn):
                 invalidates_types = True
-            query = get_create_relationship_query(obj, self.type_registry)
+            query = get_create_relationship_query(obj, type_registry)
 
         else:
             # object is an instance
             obj_type = type(obj)
             type_id = get_type_id(obj_type)
-            if type_id not in self.type_registry._types_in_db:
+            if type_id not in type_registry._types_in_db:
                 raise TypeNotPersistedError(type_id)
 
-            idx_name = get_index_name(PersistableType)
-            query = (
-                'START cls=node:%s(id={type_id}) '
-                'CREATE (n {props}) -[:INSTANCEOF {rel_props}]-> cls '
-                'RETURN n'
-            ) % idx_name
+            labels = type_registry.get_labels_for_type(obj_type)
+            if labels:
+                node_declaration = 'n:' + ':'.join(labels)
+            else:
+                node_declaration = 'n'
+
+            query = """
+                MATCH (cls:PersistableType)
+                WHERE cls.id = {type_id}
+                CREATE (%s {props})-[:INSTANCEOF {rel_props}]->(cls)
+                RETURN n
+            """ % node_declaration
 
             query_args = {
                 'type_id': get_type_id(obj_type),
-                'rel_props': self.type_registry.object_to_dict(
+                'rel_props': type_registry.object_to_dict(
                     InstanceOf(None, None), for_db=True),
             }
 
-        query_args['props'] = self.type_registry.object_to_dict(
+        query_args['props'] = type_registry.object_to_dict(
             obj, for_db=True)
 
         (node_or_rel,) = next(self._execute(query, **query_args))
         if invalidates_types:
             self.invalidate_type_system()
-        self._index_object(obj, node_or_rel)
 
+        set_store_for_object(obj, self)
         return obj
 
     def get_type_hierarchy(self, start_type_id=None):
@@ -499,39 +449,44 @@ class Manager(object):
         """
 
         if start_type_id:
-            # See note at top of page
-            match = ('p=(ts -[:DEFINES]-> (dummy1) <-[:ISA*]- opt '
-                     '<-[:ISA*0..]- tpe)')
-            where = 'WHERE opt.id = {start_id}'
+            match = """
+                p = (
+                    (ts:TypeSystem {id: "TypeSystem"})-[:DEFINES]->()<-
+                        [:ISA*]-(opt)<-[:ISA*0..]-(tpe)
+                )
+                WHERE opt.id = {start_id}
+                """
             query_args = {'start_id': start_type_id}
         else:
-            # See note at top of page
-            match = 'p=(ts -[:DEFINES]-> (dummy1) <-[:ISA*0..]- tpe)'
-            where = ''
+            match = """
+                p=(
+                    (ts:TypeSystem {id: "TypeSystem"})-[:DEFINES]->()<-
+                        [:ISA*0..]-(tpe)
+                )
+                """
             query_args = {}
 
         query = join_lines(
-            'START %s' % get_start_clause(self.type_system, 'ts',
-                                          self.type_registry),
             'MATCH',
             match,
-            where,
-            ''' WITH tpe, max(length(p)) AS level
-            MATCH
-                tpe <-[?:DECLAREDON*]- attr,
-                tpe -[isa?:ISA]-> base
+            """
+            WITH tpe, max(length(p)) AS level
+            OPTIONAL MATCH
+                tpe <-[:DECLAREDON*]- attr
+            OPTIONAL MATCH
+                tpe -[isa:ISA]-> base
 
             WITH tpe.id AS type_id, level, tpe AS class_attrs,
                 filter(
-                    idx_base in collect(DISTINCT [isa.base_index, base.id]):
-                        not(LAST(idx_base) is NULL)
+                    idx_base in collect(DISTINCT [isa.base_index, base.id])
+                    WHERE not(LAST(idx_base) is NULL)
                 ) AS bases,
 
                 collect(DISTINCT attr) AS attrs
 
             ORDER BY level
             RETURN type_id, bases, class_attrs, attrs
-            ''')
+            """)
 
         # we can't use self.query since we don't want to convert the
         # class_attrs dict
@@ -611,23 +566,23 @@ class Manager(object):
         if existing_attrs != base_attrs:
             raise CannotUpdateType("Inherited attributes are not identical")
 
-        start_clauses = [get_start_clause(tpe, 'type', self.type_registry)]
+        match_clauses = [get_match_clause(tpe, 'type', self.type_registry)]
         create_clauses = []
         query_args = {}
 
         for index, base in enumerate(bases):
             name = 'base_{}'.format(index)
-            start = get_start_clause(base, name, self.type_registry)
+            match = get_match_clause(base, name, self.type_registry)
             create = "type -[:ISA {%s_props}]-> %s" % (name, name)
 
             query_args["{}_props".format(name)] = {'base_index': index}
-            start_clauses.append(start)
+            match_clauses.append(match)
             create_clauses.append(create)
 
         query = join_lines(
-            "START",
-            (start_clauses, ','),
-            "MATCH type -[r:ISA]-> (dummy1)",  # See note at top of page
+            "MATCH",
+            (match_clauses, ','),
+            ", type -[r:ISA]-> ()",
             "DELETE r",
             "CREATE",
             (create_clauses, ','),
@@ -673,75 +628,36 @@ class Manager(object):
     def get(self, cls, **attr_filter):
         attr_filter = dict_to_db_values_dict(attr_filter)
 
+        # Workaround that allows nodes and relationships with no
+        # attrs to be saved. `save` will cause this method to be called
+        # with an empty attr_filter, and when it receives None, will add
+        # a new object.
         if not attr_filter:
             return None
 
-        query_args = {}
+        type_registry = self.type_registry
 
-        indexes = attr_filter.items()
-
-        if issubclass(cls, (Relationship, PersistableType)):
-            idx_name = get_index_name(cls)
-            idx_key, idx_value = indexes[0]
-
-            if issubclass(cls, Relationship):
-                self._conn.get_or_create_index(neo4j.Relationship, idx_name)
-                start_func = 'relationship'
-            else:
-                self._conn.get_or_create_index(neo4j.Node, idx_name)
-                start_func = 'node'
-
-            query = 'START nr = %s:%s(%s={idx_value}) RETURN nr' % (
-                start_func, idx_name, idx_key)
-
-            query_args['idx_value'] = idx_value
-
-        elif cls is TypeSystem:
-            idx_name = get_index_name(TypeSystem)
-            query = join_lines(
-                'START ts=node:%s(id={idx_value})' % idx_name,
-                'RETURN ts'
-            )
-            query_args['idx_value'] = self.type_system.id
-        else:
-            idx_where = []
-            for key, value in indexes:
-                idx_where.append('n.%s! = {%s}' % (key, key))
-                query_args[key] = value
-            idx_where = ' or '.join(idx_where)
-
-            idx_name = get_index_name(TypeSystem)
-            query = join_lines(
-                'START root=node:%s(id={idx_value})' % idx_name,
-                'MATCH ',
-                '    n -[:INSTANCEOF]-> (dummy1)',   # See note at top of page
-                '    -[:ISA*0..]-> tpe -[:ISA*0..]-> (dummy2) '
-                '    <-[:DEFINES]- root',
-                'WHERE (%s)' % idx_where,
-                '   AND tpe.id = {tpe_id}',
-                'RETURN n',
+        unique_attrs = [key for _, key in type_registry.get_unique_attrs(cls)]
+        query_params = {
+            key: value
+            for key, value in attr_filter.items()
+            if key in unique_attrs
+            and value is not None
+        }
+        if not query_params:
+            raise ValueError(
+                'No relevant indexes found when calling get for class: {}'
+                ' with filter {}'.format(cls, attr_filter)
             )
 
-            query_args['idx_value'] = self.type_system.id
+        labels = type_registry.get_labels_for_type(cls)
+        # since we found an index, we have at least one label
+        node_declaration = 'n:' + ':'.join(labels)
 
-            type_id = get_type_id(cls)
-            query_args['tpe_id'] = type_id
-
-        found = [node for (node,) in self._execute(query, **query_args)]
-
-        if not found:
-            return None
-
-        # all the nodes returned should be the same
-        first = found[0]
-        for node in found:
-            if node._id != first._id:
-                raise UniqueConstraintError((
-                    "Multiple nodes ({}) found for unique lookup for "
-                    "{}").format(found, cls))
-
-        obj = self._convert_value(first)
-        return obj
+        params = parameter_map(attr_filter, 'params')
+        return self.query_single(
+            "MATCH (%s %s) RETURN n" % (node_declaration, params),
+            params=attr_filter)
 
     def get_by_unique_attr(self, cls, attr_name, values):
         """Bulk load entities from a list of values for a unique attribute
@@ -751,33 +667,32 @@ class Manager(object):
 
         If any values are missing in the index, the corresponding obj is None
         """
-
         if not hasattr(cls, attr_name):
             raise ValueError("{} has no attribute {}".format(cls, attr_name))
 
-        attr = getattr(cls, attr_name)
-        if not attr.unique:
+        registry = self.type_registry
+        for declaring_cls, attr in registry.get_unique_attrs(cls):
+            if attr == attr_name:
+                break
+        else:
             raise ValueError("{}.{} is not unique".format(cls, attr_name))
 
+        type_id = get_type_id(cls)
+        query = "MATCH (n:%(label)s {%(attr)s: {id}}) RETURN n" % {
+            'label': type_id,
+            'attr': attr_name,
+        }
         batch = neo4j.ReadBatch(self._conn)
-
-        declaring_class = get_declaring_class(cls, attr_name)
-        index_name = get_index_name(declaring_class)
-
         for value in values:
             db_value = object_to_db_value(value)
-            batch.get_indexed_nodes(index_name, attr_name, db_value)
+            batch.append_cypher(query, params={'id': db_value})
 
         # When upgrading to py2neo 1.6, consider changing this to batch.stream
         batch_result = batch.submit()
 
-        def first_or_none(list_):
-            return next(iter(list_), None)
-
         # `batch_result` is a list of either one element lists (for matches)
         # or empty lists. Unpack to flatten (and hydrate to Kaiso objects)
-        result = (self._convert_value(
-            first_or_none(row)) for row in batch_result)
+        result = (self._convert_value(row) for row in batch_result)
 
         return result
 
@@ -797,74 +712,71 @@ class Manager(object):
         # get rid of any attributes not supported by the new type
         properties = self.serialize(self.deserialize(properties), for_db=True)
 
-        tpe = type_registry.get_class_by_id(type_id)
+        old_type = type(obj)
+        new_type = type_registry.get_class_by_id(type_id)
 
         rel_props = type_registry.object_to_dict(InstanceOf(), for_db=True)
 
-        start_clauses = (
-            get_start_clause(obj, 'obj', type_registry),
-            get_start_clause(tpe, 'tpe', type_registry)
+        old_labels = set(type_registry.get_labels_for_type(old_type))
+        new_labels = set(type_registry.get_labels_for_type(new_type))
+        removed_labels = old_labels - new_labels
+        added_labels = new_labels - old_labels
+
+        if removed_labels:
+            remove_labels_statement = 'REMOVE obj:' + ':'.join(removed_labels)
+        else:
+            remove_labels_statement = ''
+
+        if added_labels:
+            add_labels_statement = 'SET obj :' + ':'.join(added_labels)
+        else:
+            add_labels_statement = ''
+
+        match_clauses = (
+            get_match_clause(obj, 'obj', type_registry),
+            get_match_clause(new_type, 'type', type_registry)
         )
 
-        # See note at top of page
         query = join_lines(
-            'START',
-            (start_clauses, ','),
-            'MATCH (obj)-[old_rel:INSTANCEOF]->(dummy1)',
+            'MATCH',
+            (match_clauses, ','),
+            ', (obj)-[old_rel:INSTANCEOF]->()',
             'DELETE old_rel',
-            'CREATE (obj)-[new_rel:INSTANCEOF {rel_props}]->(tpe)',
+            'CREATE (obj)-[new_rel:INSTANCEOF {rel_props}]->(type)',
             'SET obj={properties}',
+            remove_labels_statement,
+            add_labels_statement,
             'RETURN obj',
         )
 
-        # use _execute; we need the raw object to add to the index
-        results = self._execute(
+        new_obj = self.query_single(
             query, properties=properties, rel_props=rel_props)
-        row = next(results, None)
 
-        if row is None:
+        if new_obj is None:
             raise NoResultFound(
                 "{} not found in db".format(repr(obj))
             )
 
-        (node,) = row
-        new_obj = self._convert_value(node)
-
-        # update any indexes
-        old_indexes = set(type_registry.get_index_entries(obj))
-        new_indexes = set(type_registry.get_index_entries(new_obj))
-        indexes_to_remove = old_indexes - new_indexes
-        indexes_to_add = new_indexes - old_indexes
-
-        for index_name, key, value in indexes_to_remove:
-            index = self._conn.get_index(neo4j.Node, index_name)
-            index.remove(key, value)
-
-        for index_name, key, value in indexes_to_add:
-            index = self._conn.get_or_create_index(neo4j.Node, index_name)
-            index.add(key, value, node)
-
         set_store_for_object(new_obj, self)
-
         return new_obj
 
     def get_related_objects(self, rel_cls, ref_cls, obj):
 
         if ref_cls is Outgoing:
-            rel_query = 'n -[relation:{}]-> related'
+            rel_query = '(n)-[relation:{}]->(related)'
         elif ref_cls is Incoming:
-            rel_query = 'n <-[relation:{}]- related'
+            rel_query = '(n)<-[relation:{}]-(related)'
 
         # TODO: should get the rel name from descriptor?
-        rel_query = rel_query.format(rel_cls.__name__.upper())
+        rel_query = rel_query.format(get_neo4j_relationship_name(rel_cls))
 
         query = join_lines(
-            'START {idx_lookup} MATCH {rel_query}',
+            'MATCH {idx_lookup}, {rel_query}'
             'RETURN related, relation'
         )
 
         query = query.format(
-            idx_lookup=get_start_clause(obj, 'n', self.type_registry),
+            idx_lookup=get_match_clause(obj, 'n', self.type_registry),
             rel_query=rel_query
         )
 
@@ -882,47 +794,40 @@ class Manager(object):
         invalidates_types = False
 
         if isinstance(obj, Relationship):
-            if is_indexable(type(obj)):
-                query = join_lines(
-                    'START',
-                    get_start_clause(obj, 'rel', self.type_registry),
-                    'DELETE rel',
-                    'RETURN 0, count(rel)'
-                )
-            else:
-                query = join_lines(
-                    'START {}, {}',
-                    'MATCH n1 -[rel]-> n2',
-                    'DELETE rel',
-                    'RETURN 0, count(rel)'
-                ).format(
-                    get_start_clause(obj.start, 'n1', self.type_registry),
-                    get_start_clause(obj.end, 'n2', self.type_registry),
-                )
+            query = join_lines(
+                'MATCH {}, {},',
+                'n1 -[rel]-> n2',
+                'DELETE rel',
+                'RETURN 0, count(rel)'
+            ).format(
+                get_match_clause(obj.start, 'n1', self.type_registry),
+                get_match_clause(obj.end, 'n2', self.type_registry),
+            )
             rel_type = type(obj)
             if rel_type in (IsA, DeclaredOn):
                 invalidates_types = True
 
         elif isinstance(obj, PersistableType):
             query = join_lines(
-                'START {}',
-                'MATCH attr -[?:DECLAREDON]-> obj',
+                'MATCH {}',
+                'OPTIONAL MATCH attr -[:DECLAREDON]-> obj',
                 'DELETE attr',
-                'MATCH obj -[rel]- (dummy1)',  # See note at top of page
+                'WITH obj',
+                'MATCH obj -[rel]- ()',
                 'DELETE obj, rel',
                 'RETURN count(obj), count(rel)'
             ).format(
-                get_start_clause(obj, 'obj', self.type_registry)
+                get_match_clause(obj, 'obj', self.type_registry)
             )
             invalidates_types = True
         else:
             query = join_lines(
-                'START {}',
-                'MATCH obj -[rel]- (dummy1)',  # See note at top of page
+                'MATCH {},',
+                'obj -[rel]- ()',
                 'DELETE obj, rel',
                 'RETURN count(obj), count(rel)'
             ).format(
-                get_start_clause(obj, 'obj', self.type_registry)
+                get_match_clause(obj, 'obj', self.type_registry)
             )
 
         # TODO: delete node/rel from indexes
@@ -952,6 +857,12 @@ class Manager(object):
 
         return (tuple(self._convert_row(row)) for row in result)
 
+    def query_single(self, query, **params):
+        """Convenience method for queries that return a single item"""
+        rows = self.query(query, **params)
+        for (item,) in rows:
+            return item
+
     def destroy(self):
         """ Removes all nodes, relationships and indexes in the store. This
             object will no longer be usable after calling this method.
@@ -961,7 +872,18 @@ class Manager(object):
 
         """
         self._conn.clear()
-        for index_name in self._conn.get_indexes(neo4j.Node).keys():
-            self._conn.delete_index(neo4j.Node, index_name)
-        for index_name in self._conn.get_indexes(neo4j.Relationship).keys():
-            self._conn.delete_index(neo4j.Relationship, index_name)
+        # NB. we assume all indexes are from constraints (only use-case for
+        # kaiso) if any aren't, this will not work
+        batch = neo4j.WriteBatch(self._conn)
+        for label in self._conn.node_labels:
+            for key in self._conn.schema.get_indexed_property_keys(label):
+                batch.append_cypher(
+                    """
+                        DROP CONSTRAINT ON (type:{type_id})
+                        ASSERT type.{attr_name} IS UNIQUE
+                    """.format(
+                        type_id=label,
+                        attr_name=key,
+                    )
+                )
+        batch.run()

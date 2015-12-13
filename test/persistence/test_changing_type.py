@@ -3,7 +3,7 @@ import pytest
 from kaiso.attributes import Uuid, String
 from kaiso.exceptions import (
     NoResultFound, NoUniqueAttributeError, TypeNotPersistedError)
-from kaiso.queries import get_start_clause, join_lines
+from kaiso.queries import get_match_clause
 from kaiso.relationships import InstanceOf
 from kaiso.types import Entity
 
@@ -32,28 +32,25 @@ def static_types(manager):
 
 
 def has_property(manager, obj, prop):
-    query_str = join_lines(
-        "START",
-        get_start_clause(obj, 'node', manager.type_registry),
-        """
-            return node.{}?
-        """.format(prop)
+    query = "MATCH {} RETURN node.{}".format(
+        get_match_clause(obj, 'node', manager.type_registry),
+        prop,
     )
 
-    properties = list(manager.query(query_str))
+    properties = list(manager.query(query))
     return not (properties == [(None,)])
 
 
 def get_instance_of_relationship(manager, obj):
-    query_str = join_lines(
-        "START",
-        get_start_clause(obj, 'node', manager.type_registry),
-        """
-            match node -[instance_of:INSTANCEOF]-> ()
-            return instance_of
-        """
+    query = """
+        MATCH
+        {},
+        (node)-[instance_of:INSTANCEOF]->()
+        RETURN instance_of
+    """.format(
+        get_match_clause(obj, 'node', manager.type_registry),
     )
-    instance_of, = next(manager.query(query_str))
+    instance_of = manager.query_single(query)
     return instance_of
 
 
@@ -65,10 +62,15 @@ def test_basic(manager, static_types):
     manager.save(thing_a)
 
     new_obj = manager.change_instance_type(thing_a, 'ThingB')
-    retrieved = manager.get(ThingB, id=thing_a.id)
+    retrieved_by_get = manager.get(ThingB, id=thing_a.id)
+    (retrieved_by_query,) = next(manager.query(
+        "MATCH (n:Thing) WHERE n.id = {id} RETURN n",
+        id=thing_a.id,
+    ))
 
     assert type(new_obj) is ThingB
-    assert type(retrieved) is ThingB
+    assert type(retrieved_by_get) is ThingB
+    assert type(retrieved_by_query) is ThingB
 
     # check new relationship has been created correctly
     instance_of_obj = get_instance_of_relationship(manager, new_obj)
@@ -243,5 +245,22 @@ def test_change_unique_declaration(manager):
 
     manager.change_instance_type(thing, 'ThingB')
 
-    assert next(manager.get_by_unique_attr(ThingA, 'id', [thing.id])) is None
-    assert next(manager.get_by_unique_attr(ThingB, 'id', [thing.id]))
+    def by_get(type_, id_):
+        return next(
+            manager.get_by_unique_attr(type_, 'id', [id_])
+        )
+
+    def by_query(type_name, id_):
+        rows = manager.query(
+            "MATCH (n:%s) WHERE n.id = {id} RETURN n" % type_name,
+            id=id_,
+        )
+        for (result,) in rows:
+            return result
+        return None
+
+    assert by_get(ThingA, thing.id) is None
+    assert by_get(ThingB, thing.id)
+
+    assert by_query('ThingA', thing.id) is None
+    assert by_query('ThingB', thing.id)

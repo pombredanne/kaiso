@@ -21,16 +21,16 @@ def test_save(manager):
     class WrappedAttr(Attribute):
         default = Wrapper()
 
-        @staticmethod
-        def to_primitive(value, for_db):
+        @classmethod
+        def to_primitive(cls, value, for_db):
             return value.unwrap()
 
-        @staticmethod
-        def to_python(value):
+        @classmethod
+        def to_python(cls, value):
             return Wrapper(value)
 
     class WrappingSpam(Entity):
-        id = Integer(default=1)
+        id = Integer(default=1, unique=True)
         wrapped = WrappedAttr()
 
     manager.save(WrappingSpam)

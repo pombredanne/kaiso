@@ -32,26 +32,48 @@ class StaticClassCollector(object):
             raise TypeAlreadyCollected(
                 "Type `{}` already defined.".format(name)
             )
+        try:
+            rel_cls = Relationship
+        except NameError:
+            # Relationship may not be defined yet.
+            pass
+        else:
+            if issubclass(cls, rel_cls):
+                neo4j_rel_name = get_neo4j_relationship_name(cls)
+                if neo4j_rel_name in self.relationships:
+                    raise TypeAlreadyCollected(
+                        "Relationship for `{}` already defined.".format(
+                            neo4j_rel_name)
+                    )
+                self.relationships[neo4j_rel_name] = name
+
         self.classes[name] = cls
         self.descriptors[name] = Descriptor(cls)
 
     def dump_state(self):
-        return self.classes.copy(), self.descriptors.copy()
+        return (
+            self.classes.copy(),
+            self.descriptors.copy(),
+            self.relationships.copy(),
+        )
 
     def load_state(self, state):
-        self.classes, self.descriptors = state
+        self.classes, self.descriptors, self.relationships = state
         # make sure we reset all descriptor caches
         for descriptor in self.descriptors.values():
             descriptor._clear_cache()
 
     def reset_state(self):
-        self.load_state(({}, {}))
+        self.load_state(({}, {}, {}))
 
     def get_descriptors(self):
         return self.descriptors
 
     def get_classes(self):
         return self.classes
+
+    def get_relationships(self):
+        return self.relationships
 
 
 collected_static_classes = StaticClassCollector()
@@ -95,6 +117,16 @@ class PersistableType(type, Persistable):
 
         cls = super(PersistableType, mcs).__new__(mcs, name, bases, dct)
         collected_static_classes.add_class(cls)
+
+        try:
+            if issubclass(cls, Relationship):
+                for key, value in dct.items():
+                    if isinstance(value, Attribute) and value.unique:
+                        raise TypeError(
+                            "Relationships may not have unique attributes")
+        except NameError:
+            pass  # Relationship (or Attribute) isn't defined yet
+
         return cls
 
 
@@ -110,6 +142,10 @@ class TypeRegistry(object):
     @property
     def _static_descriptors(self):
         return collected_static_classes.get_descriptors()
+
+    @property
+    def _relationships(self):
+        return collected_static_classes.get_relationships()
 
     def is_static_type(self, cls):
         class_id = get_type_id(cls)
@@ -195,6 +231,9 @@ class TypeRegistry(object):
         descriptor = self.get_descriptor(cls)
         descriptor._clear_cache()
 
+    def get_relationship_type_id(self, neo4j_rel_name):
+        return self._relationships[neo4j_rel_name]
+
     def get_descriptor(self, cls):
         name = get_type_id(cls)
         return self.get_descriptor_by_id(name)
@@ -222,23 +261,36 @@ class TypeRegistry(object):
         else:
             raise UnknownType('Unknown type "{}"'.format(cls_id))
 
-    def get_index_entries(self, obj):
-        if isinstance(obj, PersistableType):
-            yield (get_index_name(PersistableType), 'id', obj.__name__)
-        else:
-            obj_type = type(obj)
-            descr = self.get_descriptor(obj_type)
+    def get_unique_attrs(self, cls):
+        """Generates tuples (declaring_class, attribute_name) for
+        unique attributes"""
 
-            for name, attr in descr.attributes.items():
-                if attr.unique:
-                    declaring_class = get_declaring_class(descr.cls, name)
+        if cls is PersistableType:
+            yield(PersistableType, 'id')
+            return
 
-                    index_name = get_index_name(declaring_class)
-                    key = name
-                    value = attr.to_primitive(getattr(obj, name), for_db=True)
+        descr = self.get_descriptor(cls)
+        for name, attr in descr.attributes.items():
+            if attr.unique:
+                declaring_class = get_declaring_class(descr.cls, name)
+                yield (declaring_class, name)
 
-                    if value is not None:
-                        yield (index_name, key, value)
+    def get_labels_for_type(self, cls):
+        """We set labels for any unique attributes"""
+
+        labels = set()
+        for declaring_class, attr_name in self.get_unique_attrs(cls):
+            type_id = get_type_id(declaring_class)
+            labels.add(type_id)
+
+        return labels
+
+    def get_constraints_for_type(self, cls):
+        descr = self.get_descriptor(cls)
+        for declaring_class, attr_name in self.get_unique_attrs(cls):
+            if declaring_class is descr.cls:
+                type_id = get_type_id(cls)
+                yield (type_id, attr_name)
 
     def object_to_dict(self, obj, for_db=False):
         """ Converts a persistable object to a dict.
@@ -250,7 +302,7 @@ class TypeRegistry(object):
         being the type_id given by the descriptor for the object.
 
         For any other object all the attributes as given by the object's
-        type descriptpr will be added to the dict and encoded as required.
+        type descriptor will be added to the dict and encoded as required.
 
         Args:
             obj: A persistable  object.
@@ -287,7 +339,6 @@ class TypeRegistry(object):
             for name, attr in descr.attributes.items():
                 try:
                     obj_value = getattr(obj, name)
-                    value = attr.to_primitive(obj_value, for_db=for_db)
                 except AttributeError:
                     # if we are dealing with an extended type, we may not
                     # have the attribute set on the instance
@@ -295,9 +346,23 @@ class TypeRegistry(object):
                         value = attr.default
                     else:
                         value = None
+                else:
+                    value = attr.to_primitive(obj_value, for_db=for_db)
 
                 if for_db and value is None:
                     continue
+
+                # check that to_python will work, and raise here instead of
+                # when trying to load data (at which point it's too late)
+                if for_db:
+                    try:
+                        attr.to_python(value)
+                    except ValueError as ex:
+                        raise ValueError(
+                            "{!r} is not a valid value for {}: {}".format(
+                                obj_value, type(attr), ex
+                            )
+                        )
 
                 properties[name] = value
 
@@ -374,37 +439,18 @@ def get_declaring_class(cls, attr_name, prefer_subclass=True):
         If ``prefer_subclass`` is false, return the last class in the MRO
         that defined an attribute with the given name.
     """
-    declared_attr = None
     declaring_class = None
 
     # Start at the top of the hierarchy and determine which of the MRO have
     # the attribute. Return the lowest class that defines (or overloads) the
     # attribute, unless prefer_subclass is False.
     for base in reversed(getmro(cls)):
-        sentinel = object()
-        attr = getattr(base, attr_name, sentinel)
-        if attr is not sentinel and declared_attr is not attr:
+        if attr_name in base.__dict__:
             declaring_class = base
-            declared_attr = attr
             if not prefer_subclass:
                 break
 
     return declaring_class
-
-
-def get_index_name(cls):
-    """ Returns a cypher index name for a class.
-
-    Args:
-        cls: The class to generate an index for.
-
-    Returns:
-        An index name.
-    """
-    if issubclass(cls, PersistableType):
-        return PersistableType.__name__.lower()
-    else:
-        return cls.__name__.lower()
 
 
 def get_type_id(cls):
@@ -412,20 +458,12 @@ def get_type_id(cls):
     """
     if issubclass(cls, PersistableType):
         return PersistableType.__name__
-    else:
-        return cls.__name__
+
+    return cls.__name__
 
 
-def is_indexable(cls):
-    """ Returns True if the class ``cls`` has any indexable attributes.
-    """
-
-    descr = Descriptor(cls)
-    for _, attr in descr.attributes.items():
-        if attr.unique:
-            return True
-
-    return False
+def get_neo4j_relationship_name(cls):
+    return cls.__name__.upper()
 
 
 def cache_result(func):
@@ -519,12 +557,12 @@ class AttributeBase(object):
 
     name = None
 
-    @staticmethod
-    def to_python(value):
+    @classmethod
+    def to_python(cls, value):
         return value
 
-    @staticmethod
-    def to_primitive(value, for_db):
+    @classmethod
+    def to_primitive(cls, value, for_db):
         """ Serialize ``value`` to a primitive type suitable for inserting
             into the database or passing to e.g. ``json.dumps``
         """
@@ -577,6 +615,8 @@ class AttributedBase(Persistable):
 
         for name, attr in descriptor.attributes.items():
             setattr(obj, name, attr.default)
+        for rel_name, rel_reference in descriptor.relationships.items():
+            setattr(obj, rel_name, rel_reference.get_manager(obj))
 
         return obj
 
@@ -588,15 +628,7 @@ class AttributedBase(Persistable):
 
 
 class Entity(AttributedBase):
-    def __getattribute__(self, name):
-        cls = type(self)
-        descriptor = Descriptor(cls)
-        try:
-            rel_reference = descriptor.relationships[name]
-        except KeyError:
-            return object.__getattribute__(self, name)
-        else:
-            return rel_reference.get_manager(self)
+    pass
 
 
 class Relationship(AttributedBase):

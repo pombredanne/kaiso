@@ -1,4 +1,3 @@
-from mock import ANY
 import pytest
 
 from kaiso.types import Entity
@@ -60,37 +59,6 @@ def test_get_descriptor_returns_dynamic_type(type_registry, static_types):
 
     # check that the descriptor contains DynamicFooType's extra attributes
     assert "extra" in type_registry.get_descriptor_by_id("FooType").attributes
-
-
-def test_get_index_entries(type_registry, static_types):
-    FooType = static_types['FooType']
-
-    # create a dynamic FooType
-    attrs = {'id': Uuid(unique=True), 'extra': String(unique=True)}
-    DynamicFooType = type_registry.create_type("FooType", (), attrs)
-
-    # check index entries for the types
-    assert list(type_registry.get_index_entries(FooType)) == [
-        ('persistabletype', 'id', 'FooType')
-    ]
-    assert list(type_registry.get_index_entries(DynamicFooType)) == [
-        ('persistabletype', 'id', 'FooType')
-    ]
-
-    # create an instance
-    foo = DynamicFooType()
-    foo.extra = "hello"
-
-    # check that indices are returned for both unique attributes
-    # checl that 'extra' has a value
-    index_entries = list(type_registry.get_index_entries(foo))
-    assert len(index_entries) == 2
-    assert index_entries[0][0] == "footype"
-    assert index_entries[0][1] == "id"
-    assert index_entries[0][2] == ANY  # id not known
-    assert index_entries[1][0] == "footype"
-    assert index_entries[1][1] == "extra"
-    assert index_entries[1][2] == "hello"
 
 
 def test_is_static_type(type_registry, static_types):
@@ -177,3 +145,18 @@ def test_has_code_defined_attribute(type_registry, static_types):
     assert not type_registry.has_code_defined_attribute(BType, "bar")
     assert not type_registry.has_code_defined_attribute(A1Type, "bar")
     assert not type_registry.has_code_defined_attribute(B1Type, "bar")
+
+
+def test_get_labels_for_type_includes_unique(type_registry, static_types):
+    FooType = type_registry.create_type("FooType", (), {})
+    labels = set(type_registry.get_labels_for_type(FooType))
+    assert labels == set()
+
+    attrs = {'id': Uuid(unique=True)}
+    BarType = type_registry.create_type("BarType", (), attrs)
+    labels = set(type_registry.get_labels_for_type(BarType))
+    assert labels == set(['BarType'])
+
+    QuuType = type_registry.create_type("QuuType", (BarType,), {})
+    labels = set(type_registry.get_labels_for_type(QuuType))
+    assert labels == set(['BarType'])

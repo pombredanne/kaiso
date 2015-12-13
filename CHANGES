@@ -1,3 +1,110 @@
+Version 0.40.0
+--------------
+
+Create types with MERGE instead of CREATE UNIQUE (to work around neo4j bug)
+Drop support for the temp:// db
+
+
+Version 0.30.2
+------------------
+
+Bugfix in `get_declared_attrs`
+
+
+Version 0.30.1
+------------------
+
+Set relationship references when instantiating entities to remove need for
+`__getattribute__`, which slows down attribute access.
+
+
+Version 0.30.0
+------------------
+
+Stop using legacy indexes in favour of label indexes. Relationship indexes are
+no longer supported.
+
+Manager kwarg `skip_type_loading` has been renamed `skip_setup` to
+reflect more processing being bypassed.
+
+
+Version 0.23.0
+------------------
+
+Add `get_match_clause` to replace `get_start_clause` using label index lookups
+and switch all node lookups. Relationship lookups left until unique attributes
+on relationships are deprecated
+
+
+Version 0.22.0
+--------------
+
+Allow py2neo primitives nested in lists of lists to be converted to python objects
+in query results.
+
+
+Version 0.21.0
+--------------
+
+Start creating labels and constraints for types with unique attributes. This
+begins the migration away from legacy indexes towards using labels.
+
+
+Version 0.20.1
+--------------
+
+Bugfix: Ensure all class attributes are set correctly in migration helpers.
+
+
+Version 0.20.0
+--------------
+
+Dropped support for Neo4j 1.9 Cypher in favour of 2.0.
+
+
+Version 0.17.1
+--------------
+
+Migration helpers enhancement to allow the `type_registry` to be previewed when
+changing bases for a type.
+
+
+Version 0.17.0
+--------------
+
+Add type coercion and validation. Attribute values for builtin types (e.g. int)
+are now coerced before inserting into the db, and for types that use more
+permissive primitive types in the db (e.g. uuids stored as strings), values are
+also validated to be correctly coercible back when retrieving from the db.
+
+
+Version 0.16.2
+--------------
+
+Bugfix: Manager `get` method raises ValueError if given attr=None.
+
+
+Version 0.16.1
+--------------
+
+Bugfix: Don't break with non-ascii query parameters.
+
+
+Version 0.16.0
+--------------
+
+Manager `get` method now only queries via indexes. It is no longer possible
+to find nodes/relationships via `get` by providing non-indexed attribute
+values.
+
+
+Version 0.15.2
+--------------
+
+Bugfix to make sure indexes are only created for types with unique attrs.
+Downgrade py2neo to v1.5 until 1.6 has some performance enhancements.
+
+
 Version 0.15.1
 --------------
 

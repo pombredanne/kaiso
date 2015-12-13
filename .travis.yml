@@ -2,22 +2,21 @@ language: python
 python:
   - "2.7"
 env:
-  - NEO4J_VERSION=1.9.5
-  - NEO4J_VERSION=2.0.0
+  - NEO4J_VERSION=2.0.4
+  - NEO4J_VERSION=2.1.6
 
 before_install:
   - wget -O - http://debian.neo4j.org/neotechnology.gpg.key | sudo apt-key add -
   - echo 'deb http://debian.neo4j.org/repo stable/' | sudo tee /etc/apt/sources.list.d/neo4j.list
   - sudo apt-get update -qq
-  - sudo apt-get install neo4j=$NEO4J_VERSION
+  - sudo apt-get install neo4j=$NEO4J_VERSION --force-yes
 
-# use sudo to work around neo4j bug: https://github.com/neo4j/neo4j/issues/984
 install:
-  - sudo python setup.py -q install
-  - sudo pip install -r test_requirements.txt
+  - python setup.py -q install
+  - pip install -r test_requirements.txt
 
 script:
-  - sudo make test
+  - make test
 
 notifications:
   email: false

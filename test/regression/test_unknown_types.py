@@ -7,7 +7,7 @@ from kaiso.types import Entity
 fixture = pytest.mark.usefixtures('storage')
 
 
-def test_skip_type_loading(manager, manager_factory):
+def test_skip_setup(manager, manager_factory):
     # Type loading will fail if the database contains references to an unknown
     # attribute or base (i.e. __type__ refers to a class not known by Python).
     # Test we can skip it when creating a manager. (e.g. for the one we use to
@@ -20,7 +20,7 @@ def test_skip_type_loading(manager, manager_factory):
     manager.save(Unknown)
     result = manager._execute("""
         START n=node(*)
-        WHERE n.name! = "unknown_attr"
+        WHERE n.name = "unknown_attr"
         SET n.__type__ = "UnknownAttribute";
     """)
 
@@ -28,4 +28,4 @@ def test_skip_type_loading(manager, manager_factory):
     list(result)
 
     # should succeed
-    manager_factory(skip_type_loading=True)
+    manager_factory(skip_setup=True)
